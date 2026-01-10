@@ -1,113 +1,68 @@
 # Open WebUI MCP Server
 
-An MCP (Model Context Protocol) server that exposes Open WebUI's admin APIs as tools, allowing AI assistants to manage users, groups, models, knowledge bases, and more.
+> 🤖 **Manage your Open WebUI instance through AI assistants** — users, groups, models, knowledge bases, chats, and more!
 
-## Features
+[![Fork](https://img.shields.io/badge/Fork%20of-troylar%2Fopen--webui--mcp--server-blue)](https://github.com/troylar/open-webui-mcp-server)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- **User Management**: List, get, update roles, delete users
-- **Group Management**: Create, update, add/remove members, delete groups
-- **Model Management**: Create custom models, update system prompts, manage parameters
-- **Knowledge Base Management**: Create, list, delete knowledge bases
-- **Chat Management**: List, view, delete chats
-- **Tool & Function Discovery**: List available tools and functions
-- **Permission-Aware**: All operations respect the logged-in user's permissions
+This is an enhanced fork of [troylar/open-webui-mcp-server](https://github.com/troylar/open-webui-mcp-server), rebuilt for **self-hosted VPS deployment** with **Streamable HTTP transport**.
 
-## Security
+---
 
-**Important**: This server passes through the user's authentication token to Open WebUI. This means:
+## ✨ Features
 
-- Admin operations require admin API keys
-- Regular users can only access their own resources
-- All permission checks are enforced by Open WebUI's API
+- **🌐 Remote Access** — Connect from any MCP client via HTTPS
+- **🔐 Multi-Tenant** — Each user provides their own Open WebUI credentials via URL
+- **📊 60+ Tools** — Full management of users, groups, models, knowledge bases, chats, prompts, memories, tools, functions, and more
+- **🔄 Auto-Deployment** — Push to GitHub, automatically deploys to VPS
+- **📈 Analytics Dashboard** — Built-in usage tracking with Firebase integration
 
-## Installation
+---
 
-```bash
-pip install openwebui-mcp-server
-```
+## 🚀 Quick Start
 
-Or with uv:
+### Add to Your MCP Client
 
-```bash
-uv pip install openwebui-mcp-server
-```
+Copy this configuration to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
 
-## Configuration
-
-Set the required environment variable:
-
-```bash
-export OPENWEBUI_URL=https://your-openwebui-instance.com
-```
-
-Optionally, set a default API key (can be overridden per-request):
-
-```bash
-export OPENWEBUI_API_KEY=your-api-key
-```
-
-## Usage
-
-### With Claude Desktop
-
-Add to your Claude Desktop config (`~/.config/claude/claude_desktop_config.json`):
-
+**Claude Desktop** (`claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
     "openwebui": {
-      "command": "openwebui-mcp",
-      "env": {
-        "OPENWEBUI_URL": "https://your-openwebui-instance.com",
-        "OPENWEBUI_API_KEY": "your-api-key"
-      }
+      "transport": "streamable-http",
+      "url": "https://mcp.techmavie.digital/openwebui/mcp?url=YOUR_OPENWEBUI_URL&key=YOUR_API_KEY"
     }
   }
 }
 ```
 
-### With Open WebUI (via MCPO)
-
-1. Start the server in HTTP mode:
-
-```bash
-export OPENWEBUI_URL=https://your-openwebui-instance.com
-export MCP_TRANSPORT=http
-export MCP_HTTP_PORT=8001
-openwebui-mcp
+**Cursor/Windsurf** (MCP settings):
+```json
+{
+  "openwebui": {
+    "transport": "streamable-http",
+    "url": "https://mcp.techmavie.digital/openwebui/mcp?url=YOUR_OPENWEBUI_URL&key=YOUR_API_KEY"
+  }
+}
 ```
 
-2. Add as MCP server in Open WebUI:
-   - Go to **Admin Settings → External Tools**
-   - Add new MCP server with URL: `http://localhost:8001/mcp`
+### URL Parameters
 
-### Programmatic Usage
+| Parameter | Required | Description | Example |
+|-----------|----------|-------------|---------|
+| `url` | Yes | Your Open WebUI instance URL | `https://ai.example.com` |
+| `key` | Yes | Your Open WebUI API key | `sk-abc123...` |
 
-```python
-from openwebui_mcp.client import OpenWebUIClient
+### Get Your API Key
 
-client = OpenWebUIClient(
-    base_url="https://your-openwebui-instance.com",
-    api_key="your-api-key"
-)
+1. Log in to your Open WebUI instance
+2. Go to **Settings → Account**
+3. Copy your API key
 
-# List all users (admin only)
-users = await client.list_users()
+---
 
-# Create a group
-group = await client.create_group("Engineering", "Engineering team")
-
-# Create a custom model
-model = await client.create_model(
-    id="my-assistant",
-    name="My Assistant",
-    base_model_id="gpt-4",
-    meta={"system": "You are a helpful assistant."},
-    params={"temperature": 0.7}
-)
-```
-
-## Available Tools
+## 🛠️ Available Tools (60+)
 
 ### User Management
 | Tool | Description | Permission |
@@ -144,7 +99,17 @@ model = await client.create_model(
 | `list_knowledge_bases` | List knowledge bases | Any |
 | `get_knowledge_base` | Get knowledge base details | Any |
 | `create_knowledge_base` | Create knowledge base | Any |
+| `update_knowledge_base` | Update knowledge base | Owner |
 | `delete_knowledge_base` | Delete knowledge base | Owner |
+
+### File Management
+| Tool | Description | Permission |
+|------|-------------|------------|
+| `list_files` | List uploaded files | Any |
+| `get_file` | Get file metadata | Any |
+| `get_file_content` | Get extracted text content | Any |
+| `update_file_content` | Update file content | Owner |
+| `delete_file` | Delete a file | Owner |
 
 ### Chat Management
 | Tool | Description | Permission |
@@ -153,41 +118,141 @@ model = await client.create_model(
 | `get_chat` | Get chat messages | Own |
 | `delete_chat` | Delete a chat | Own |
 | `delete_all_chats` | Delete all chats | Own |
+| `archive_chat` | Archive a chat | Own |
+| `share_chat` | Share a chat publicly | Own |
+| `clone_chat` | Clone a shared chat | Any |
 
-### System
+### Prompt Management
+| Tool | Description | Permission |
+|------|-------------|------------|
+| `list_prompts` | List prompt templates | Any |
+| `get_prompt` | Get prompt by command | Any |
+| `create_prompt` | Create prompt template | Any |
+| `update_prompt` | Update prompt | Owner |
+| `delete_prompt` | Delete prompt | Owner |
+
+### Memory Management
+| Tool | Description | Permission |
+|------|-------------|------------|
+| `list_memories` | List stored memories | Own |
+| `add_memory` | Add a new memory | Own |
+| `query_memories` | Semantic search memories | Own |
+| `update_memory` | Update a memory | Own |
+| `delete_memory` | Delete a memory | Own |
+| `delete_all_memories` | Delete all memories | Own |
+
+### Tool & Function Management
 | Tool | Description | Permission |
 |------|-------------|------------|
 | `list_tools` | List available tools | Any |
+| `create_tool` | Create custom tool | Admin |
 | `list_functions` | List functions/filters | Any |
-| `get_system_config` | Get system config | Admin |
+| `create_function` | Create function | Admin |
+| `toggle_function` | Enable/disable function | Admin |
 
-## Development
+### Notes & Channels
+| Tool | Description | Permission |
+|------|-------------|------------|
+| `list_notes` | List notes | Own |
+| `create_note` | Create a note | Own |
+| `list_channels` | List team channels | Any |
+| `post_channel_message` | Post to channel | Any |
+
+### System (Admin)
+| Tool | Description | Permission |
+|------|-------------|------------|
+| `get_system_config` | Get system config | Admin |
+| `export_config` | Export full config | Admin |
+| `get_banners` | Get notification banners | Any |
+| `get_models_config` | Get models config | Admin |
+| `get_tool_servers` | Get MCP/OpenAPI servers | Admin |
+
+---
+
+## 🖥️ API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Server information |
+| `/health` | GET | Health check |
+| `/mcp` | POST | MCP protocol endpoint |
+| `/analytics` | GET | Analytics JSON data |
+| `/analytics/dashboard` | GET | Visual analytics dashboard |
+
+---
+
+## 🏠 Self-Hosting Guide
+
+### Prerequisites
+
+- VPS with Docker & Docker Compose
+- Nginx with SSL (Let's Encrypt)
+- Domain pointing to VPS (e.g., `mcp.yourdomain.com`)
+
+### Deployment Files
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile` | Container build configuration |
+| `docker-compose.yml` | Docker orchestration |
+| `deploy/nginx-mcp.conf` | Nginx reverse proxy config |
+| `.github/workflows/deploy-vps.yml` | Auto-deployment workflow |
+
+### Quick Deploy
 
 ```bash
-# Clone the repo
-git clone https://github.com/troylar/open-webui-mcp-server.git
-cd open-webui-mcp-server
+# On your VPS
+mkdir -p /opt/mcp-servers/mcp-openwebui
+cd /opt/mcp-servers/mcp-openwebui
+git clone https://github.com/hithereiamaliff/mcp-openwebui.git .
 
-# Install dev dependencies
-pip install -e ".[dev]"
+# Build and start
+docker compose up -d --build
 
-# Run tests
-pytest
-
-# Run linter
-ruff check src/
+# Check logs
+docker compose logs -f
 ```
 
-## License
+### Configure Nginx
 
-MIT License - see [LICENSE](LICENSE) for details.
+```bash
+sudo nano /etc/nginx/sites-available/mcp.techmavie.digital
+# Add the location block from deploy/nginx-mcp.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
 
-## Contributing
+### GitHub Secrets (for auto-deployment)
 
-Contributions welcome! Please open an issue or PR on GitHub.
+Set these in your repository settings:
 
-## Related Projects
+- `VPS_HOST` — Your VPS IP address
+- `VPS_USERNAME` — SSH username
+- `VPS_SSH_KEY` — Private SSH key
+- `VPS_PORT` — SSH port (usually 22)
 
-- [Open WebUI](https://github.com/open-webui/open-webui) - The web UI this server manages
-- [FastMCP](https://github.com/jlowin/fastmcp) - The MCP framework used
-- [MCPO](https://github.com/open-webui/mcpo) - MCP to OpenAPI proxy
+---
+
+## 🔄 What's Changed from Original
+
+| Aspect | Original | This Fork |
+|--------|----------|-----------|
+| **Language** | Python (FastMCP) | TypeScript (Node.js) |
+| **Transport** | stdio / HTTP (uvicorn) | Streamable HTTP (Express) |
+| **Hosting** | Local / pip install | Self-hosted VPS |
+| **Auth** | Environment variable | URL query parameters |
+| **Deployment** | Manual | Auto via GitHub Actions |
+| **Analytics** | None | Firebase + Dashboard |
+
+---
+
+## 📄 License
+
+MIT License — See [LICENSE](LICENSE) file for details.
+
+---
+
+## 🙏 Credits
+
+- Original MCP server by [@troylar](https://github.com/troylar/open-webui-mcp-server)
+- Enhanced by [@hithereiamaliff](https://github.com/hithereiamaliff)

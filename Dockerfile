@@ -1,28 +1,53 @@
-FROM python:3.12-slim
+# Open WebUI MCP Server - Streamable HTTP
+# For self-hosting on VPS with nginx reverse proxy
+
+FROM node:20-alpine
 
 WORKDIR /app
 
-# Install uv for faster package installation
-RUN pip install uv
+# Copy package files
+COPY package*.json ./
+COPY tsconfig.json ./
 
-# Copy pyproject.toml for dependency installation
-COPY pyproject.toml .
+# Install ALL dependencies (including devDependencies for build)
+# Skip prepare script since source files aren't copied yet
+RUN npm ci --ignore-scripts
 
-# Install dependencies
-RUN uv pip install --system fastmcp httpx pydantic uvicorn
-
-# Copy application code
+# Copy source code
 COPY src/ ./src/
 
-# Environment variables
-ENV PYTHONUNBUFFERED=1
-ENV MCP_TRANSPORT=http
-ENV MCP_HTTP_HOST=0.0.0.0
-ENV MCP_HTTP_PORT=8000
-ENV MCP_HTTP_PATH=/mcp
+# Build TypeScript
+RUN npm run build:tsc
 
-# Expose MCP port
-EXPOSE 8000
+# Remove devDependencies after build
+RUN npm prune --production
 
-# Run the server
-CMD ["python", "-m", "src.openwebui_mcp.main"]
+# Create non-root user for security
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S mcp -u 1001
+
+# Create data directory for analytics
+RUN mkdir -p /app/data
+
+# Create credentials directory (will be mounted as volume)
+RUN mkdir -p /app/.credentials
+
+# Set ownership
+RUN chown -R mcp:nodejs /app
+
+USER mcp
+
+# Expose port for HTTP server
+EXPOSE 8080
+
+# Environment variables (can be overridden at runtime)
+ENV PORT=8080
+ENV HOST=0.0.0.0
+ENV ANALYTICS_DIR=/app/data
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+# Start the HTTP server
+CMD ["node", "build/http-server.js"]
