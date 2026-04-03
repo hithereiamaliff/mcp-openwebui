@@ -8,18 +8,24 @@
 
 import express, { Request, Response } from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { OpenWebUIClient } from './openwebui-client.js';
 import { FirebaseAnalytics, Analytics } from './firebase-analytics.js';
+import { isKeyServiceEnabled, resolveKeyCredentials } from './utils/key-service.js';
 
 // Configuration
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const ANALYTICS_DATA_DIR = process.env.ANALYTICS_DIR || '/app/data';
+const MCP_API_KEY = process.env.MCP_API_KEY || '';
+const PUBLIC_BASE_PATH = normalizePublicBasePath(process.env.PUBLIC_BASE_PATH || '');
+const ENABLE_MCP_DIAGNOSTICS = /^(1|true|yes|on)$/i.test(process.env.ENABLE_MCP_DIAGNOSTICS || '');
 const ANALYTICS_FILE = path.join(ANALYTICS_DATA_DIR, 'analytics.json');
 const SAVE_INTERVAL_MS = 60000;
 const MAX_RECENT_CALLS = 100;
@@ -37,6 +43,24 @@ let analytics: Analytics = {
   clientsByUserAgent: {},
   hourlyRequests: {},
 };
+
+function hashIp(ip: string): string {
+  return crypto.createHash('sha256').update(ip).digest('hex').substring(0, 12);
+}
+
+function normalizePublicBasePath(basePath: string): string {
+  const trimmed = basePath.trim();
+  if (!trimmed || trimmed === '/') {
+    return '';
+  }
+
+  const withLeadingSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/+$/, '');
+}
+
+function withPublicBasePath(route: string): string {
+  return `${PUBLIC_BASE_PATH}${route}`;
+}
 
 // Ensure data directory exists
 function ensureDataDir(): void {
@@ -94,7 +118,8 @@ function trackRequest(req: Request, endpoint: string): void {
   analytics.requestsByEndpoint[endpoint] = (analytics.requestsByEndpoint[endpoint] || 0) + 1;
   
   const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || 'unknown';
-  analytics.clientsByIp[clientIp] = (analytics.clientsByIp[clientIp] || 0) + 1;
+  const hashedIp = hashIp(clientIp);
+  analytics.clientsByIp[hashedIp] = (analytics.clientsByIp[hashedIp] || 0) + 1;
   
   const userAgent = req.headers['user-agent'] || 'unknown';
   const shortAgent = userAgent.substring(0, 50);
@@ -109,10 +134,11 @@ function trackToolCall(toolName: string, req: Request): void {
   analytics.totalToolCalls++;
   analytics.toolCalls[toolName] = (analytics.toolCalls[toolName] || 0) + 1;
   
+  const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || 'unknown';
   const toolCall = {
     tool: toolName,
     timestamp: new Date().toISOString(),
-    clientIp: (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || 'unknown',
+    clientIp: hashIp(clientIp),
     userAgent: (req.headers['user-agent'] || 'unknown').substring(0, 50),
   };
   
@@ -135,6 +161,43 @@ function getUptime(): string {
   if (days > 0) return `${days}d ${hours}h ${minutes}m`;
   if (hours > 0) return `${hours}h ${minutes}m`;
   return `${minutes}m`;
+}
+
+function sendJsonRpcError(
+  res: Response,
+  status: number,
+  message: string,
+  data?: Record<string, unknown>
+): void {
+  res.status(status).json({
+    jsonrpc: '2.0',
+    error: {
+      code: -32600,
+      message,
+      ...(data ? { data } : {}),
+    },
+    id: null,
+  });
+}
+
+function requireAnalyticsApiKey(req: Request, res: Response): boolean {
+  if (!MCP_API_KEY) {
+    res.status(503).json({
+      error: 'server_misconfigured',
+      message: 'MCP_API_KEY is required to access analytics on this deployment.',
+    });
+    return false;
+  }
+
+  if (req.get('X-API-Key') === MCP_API_KEY) {
+    return true;
+  }
+
+  res.status(401).json({
+    error: 'unauthorized',
+    message: 'Valid X-API-Key header required.',
+  });
+  return false;
 }
 
 // Initialize Firebase Analytics
@@ -798,20 +861,155 @@ function createMcpServer(openwebuiUrl: string, apiKey: string) {
   return server;
 }
 
+// Create a minimal MCP server for diagnostics (no auth required)
+function createDiagnosticMcpServer(): McpServer {
+  const server = new McpServer({
+    name: 'openwebui-mcp-diagnostics',
+    version: '1.0.0',
+  });
+
+  server.tool(
+    'diagnostics_ping',
+    'Minimal unauthenticated MCP tool for transport and connector troubleshooting',
+    {},
+    async () => ({
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          message: 'Open WebUI MCP diagnostics endpoint is reachable.',
+          timestamp: new Date().toISOString(),
+          authentication: 'none',
+          diagnosticsEnabled: true,
+        }, null, 2),
+      }],
+    })
+  );
+
+  return server;
+}
+
+// Per-request MCP server + transport isolation
+async function handleServerRequest(req: Request, res: Response, server: McpServer): Promise<void> {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+  let cleanedUp = false;
+
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    void transport.close();
+    void server.close();
+  };
+
+  try {
+    res.once('finish', cleanup);
+    res.once('close', cleanup);
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+
+    if (res.writableEnded) {
+      cleanup();
+    }
+  } catch (error) {
+    console.error('MCP request error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null,
+      });
+      cleanup();
+    }
+  }
+}
+
+// Shared handler: resolve credentials → create server → handle request
+async function handleMcpRequest(req: Request, res: Response, credentials: { url: string; apiKey: string }): Promise<void> {
+  // Ensure Accept header includes text/event-stream for SSE compatibility
+  const acceptHeader = req.headers['accept'] || '';
+  if (!acceptHeader.includes('text/event-stream')) {
+    req.headers['accept'] = acceptHeader ? `${acceptHeader}, text/event-stream` : 'text/event-stream';
+  }
+
+  // Track tool calls
+  if (req.body?.method === 'tools/call' && req.body?.params?.name) {
+    trackToolCall(req.body.params.name, req);
+  }
+
+  // Normalize scheme-less hosts
+  let url = credentials.url;
+  if (url && !url.match(/^https?:\/\//)) {
+    url = `https://${url}`;
+  }
+
+  const server = createMcpServer(url, credentials.apiKey);
+  await handleServerRequest(req, res, server);
+}
+
+// Server card for MCP discovery
+function getServerCard(): Record<string, unknown> {
+  return {
+    $schema: 'https://static.modelcontextprotocol.io/schemas/mcp-server-card/v1.json',
+    version: '1.0',
+    protocolVersion: LATEST_PROTOCOL_VERSION,
+    serverInfo: {
+      name: 'openwebui-mcp-server',
+      version: '1.0.0',
+    },
+    transport: {
+      type: 'streamable-http',
+      endpoint: withPublicBasePath('/mcp'),
+    },
+    authentication: {
+      required: true,
+      notes: [
+        'Requires a usr_XXXXXXXX API key from the MCP Key Service.',
+        `Use ${withPublicBasePath('/mcp/usr_XXXXXXXX')} or ${withPublicBasePath('/mcp?api_key=usr_XXXXXXXX')}`,
+      ],
+    },
+    tools: ['dynamic'],
+  };
+}
+
+// OAuth metadata handler — explicitly return no-OAuth response
+function handleNoOAuthMetadata(req: Request, res: Response): void {
+  trackRequest(req, '/.well-known');
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(404).json({
+    supported: false,
+    authentication: 'none',
+    message: 'This MCP deployment does not advertise OAuth metadata.',
+    path: req.path,
+  });
+}
+
+// Log startup auth mode
+if (isKeyServiceEnabled()) {
+  console.log('🔑 Key Service mode enabled — accepting usr_XXX keys only.');
+} else {
+  console.warn('⚠️ KEY_SERVICE_URL or KEY_SERVICE_TOKEN not configured. Key service auth will return 503.');
+}
+if (ENABLE_MCP_DIAGNOSTICS) {
+  console.log('🔧 MCP diagnostics endpoint enabled at /mcp-debug/open');
+}
+
 // Create Express app
 const app = express();
 app.use(express.json());
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'Accept'],
+  allowedHeaders: [
+    'Content-Type', 'Accept', 'Authorization',
+    'Mcp-Session-Id', 'MCP-Protocol-Version', 'Last-Event-ID',
+    'X-API-Key',
+  ],
+  exposedHeaders: ['Mcp-Session-Id'],
   credentials: false,
 }));
 
 app.options('*', cors());
-
-// Store MCP servers per credentials
-const mcpServers = new Map<string, McpServer>();
 
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
@@ -834,17 +1032,29 @@ app.get('/', (req: Request, res: Response) => {
     version: '1.0.0',
     description: 'MCP server for managing Open WebUI - users, groups, models, knowledge bases, chats, and more',
     endpoints: {
-      health: '/health',
-      mcp: '/mcp?url=YOUR_OPENWEBUI_URL&key=YOUR_API_KEY',
-      analytics: '/analytics',
-      dashboard: '/analytics/dashboard',
+      health: withPublicBasePath('/health'),
+      mcp: withPublicBasePath('/mcp/usr_XXXXXXXX'),
+      mcp_query: withPublicBasePath('/mcp?api_key=usr_XXXXXXXX'),
+      server_card: withPublicBasePath('/.well-known/mcp/server-card.json'),
+      analytics: withPublicBasePath('/analytics'),
+      dashboard: withPublicBasePath('/analytics/dashboard'),
     },
+    authentication: {
+      mode: 'key-service',
+      status: isKeyServiceEnabled() ? 'enabled' : 'not configured',
+      usage: 'Register at the MCP Key Service portal to get a usr_XXX API key.',
+    },
+    analytics_auth: MCP_API_KEY ? 'X-API-Key required' : 'disabled (set MCP_API_KEY to enable /analytics)',
     documentation: 'https://github.com/hithereiamaliff/mcp-openwebui',
   });
 });
 
 // Analytics endpoint
 app.get('/analytics', (req: Request, res: Response) => {
+  if (!requireAnalyticsApiKey(req, res)) {
+    return;
+  }
+
   trackRequest(req, '/analytics');
   res.json({
     ...analytics,
@@ -868,6 +1078,14 @@ app.get('/analytics/dashboard', (req: Request, res: Response) => {
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 20px; }
     .container { max-width: 1400px; margin: 0 auto; }
     h1 { font-size: 1.8rem; margin-bottom: 20px; color: #f8fafc; }
+    .auth-card { background: #111827; border: 1px solid #334155; border-radius: 12px; padding: 16px; margin-bottom: 20px; }
+    .auth-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    .auth-input { flex: 1 1 260px; min-width: 220px; padding: 10px 12px; border: 1px solid #475569; border-radius: 10px; background: #0f172a; color: #f8fafc; }
+    .auth-button { padding: 10px 14px; border: 0; border-radius: 10px; cursor: pointer; font-weight: 600; }
+    .auth-button.primary { background: #3b82f6; color: #eff6ff; }
+    .auth-button.secondary { background: #334155; color: #e2e8f0; }
+    .auth-status { margin-top: 10px; font-size: 0.9rem; color: #94a3b8; }
+    .auth-status.error { color: #fca5a5; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 20px; }
     .card { background: #1e293b; border-radius: 12px; padding: 20px; }
     .card h3 { font-size: 0.875rem; color: #94a3b8; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -887,6 +1105,14 @@ app.get('/analytics/dashboard', (req: Request, res: Response) => {
 <body>
   <div class="container">
     <h1>Open WebUI MCP - Analytics Dashboard</h1>
+    <div class="auth-card">
+      <div class="auth-row">
+        <input id="apiKeyInput" class="auth-input" type="password" placeholder="Enter analytics X-API-Key" autocomplete="off">
+        <button id="loadDashboard" class="auth-button primary" type="button">Load Dashboard</button>
+        <button id="clearApiKey" class="auth-button secondary" type="button">Clear Key</button>
+      </div>
+      <div id="authStatus" class="auth-status"></div>
+    </div>
     <div class="grid">
       <div class="card">
         <h3>Total Requests</h3>
@@ -932,15 +1158,47 @@ app.get('/analytics/dashboard', (req: Request, res: Response) => {
   </div>
   <script>
     let toolsChart, hourlyChart, endpointChart;
+    const analyticsEnabled = ${MCP_API_KEY ? 'true' : 'false'};
+    const API_KEY_STORAGE_KEY = 'openwebui-mcp-dashboard-api-key';
     const chartColors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
+    const authStatus = document.getElementById('authStatus');
+    const apiKeyInput = document.getElementById('apiKeyInput');
     
-    async function loadData() {
-      try {
-        const basePath = window.location.pathname.replace(/\\/analytics\\/dashboard\\/?$/, '');
-        const res = await fetch(basePath + '/analytics');
-        const data = await res.json();
-        updateDashboard(data);
-      } catch (err) { console.error('Failed to load analytics:', err); }
+    function setAuthStatus(message, isError) {
+      authStatus.textContent = message;
+      authStatus.className = isError ? 'auth-status error' : 'auth-status';
+    }
+    
+    function getApiKey() {
+      return apiKeyInput.value.trim();
+    }
+    
+    function saveApiKey(apiKey) {
+      if (apiKey) {
+        sessionStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
+      } else {
+        sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+      }
+    }
+    
+    function clearApiKey() {
+      sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+      apiKeyInput.value = '';
+      setAuthStatus('Analytics API key cleared from this tab.', false);
+    }
+    
+    async function fetchData(apiKey) {
+      const basePath = window.location.pathname.replace(/\\/analytics\\/dashboard\\/?$/, '');
+      const res = await fetch(basePath + '/analytics', {
+        headers: {
+          'X-API-Key': apiKey,
+        },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.message || 'Failed to load analytics.');
+      }
+      return data;
     }
     
     function updateDashboard(data) {
@@ -994,8 +1252,53 @@ app.get('/analytics/dashboard', (req: Request, res: Response) => {
       list.innerHTML = recentCalls.slice(0, 15).map(call => '<div class="activity-item"><div><span class="activity-tool">' + call.tool + '</span><div class="activity-ip">' + call.clientIp + '</div></div><span class="activity-time">' + new Date(call.timestamp).toLocaleString() + '</span></div>').join('');
     }
     
-    loadData();
-    setInterval(loadData, 30000);
+    async function refresh() {
+      if (!analyticsEnabled) {
+        setAuthStatus('Analytics are disabled on this deployment. Set MCP_API_KEY to enable them.', true);
+        return;
+      }
+      
+      const apiKey = getApiKey();
+      if (!apiKey) {
+        setAuthStatus('Enter the analytics API key to load data.', false);
+        return;
+      }
+      
+      saveApiKey(apiKey);
+      setAuthStatus('Loading analytics...', false);
+      
+      try {
+        const data = await fetchData(apiKey);
+        updateDashboard(data);
+        setAuthStatus('Analytics loaded. The API key is stored only in this tab session.', false);
+      } catch (error) {
+        setAuthStatus(error instanceof Error ? error.message : 'Failed to load analytics.', true);
+      }
+    }
+    
+    document.getElementById('loadDashboard').addEventListener('click', refresh);
+    document.getElementById('clearApiKey').addEventListener('click', clearApiKey);
+    apiKeyInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        refresh();
+      }
+    });
+    
+    const storedApiKey = sessionStorage.getItem(API_KEY_STORAGE_KEY);
+    if (storedApiKey) {
+      apiKeyInput.value = storedApiKey;
+      refresh();
+    } else if (analyticsEnabled) {
+      setAuthStatus('Enter the analytics API key to load data. It will not be placed in the URL.', false);
+    } else {
+      setAuthStatus('Analytics are disabled on this deployment. Set MCP_API_KEY to enable them.', true);
+    }
+    
+    setInterval(() => {
+      if (analyticsEnabled && sessionStorage.getItem(API_KEY_STORAGE_KEY)) {
+        refresh();
+      }
+    }, 30000);
   </script>
 </body>
 </html>`;
@@ -1003,59 +1306,118 @@ app.get('/analytics/dashboard', (req: Request, res: Response) => {
   res.type('html').send(dashboardHtml);
 });
 
-// MCP endpoint
-app.all('/mcp', async (req: Request, res: Response) => {
-  const acceptHeader = req.headers['accept'] || '';
-  if (!acceptHeader.includes('text/event-stream')) {
-    req.headers['accept'] = acceptHeader ? `${acceptHeader}, text/event-stream` : 'text/event-stream';
-  }
-  trackRequest(req, '/mcp');
-  
-  if (req.body && req.body.method === 'tools/call' && req.body.params?.name) {
-    trackToolCall(req.body.params.name, req);
-  }
-  
-  try {
-    let openwebuiUrl = req.query.url as string || '';
-    const apiKey = req.query.key as string || '';
-    
-    if (openwebuiUrl && !openwebuiUrl.match(/^https?:\/\//)) {
-      openwebuiUrl = `https://${openwebuiUrl}`;
-    }
-    
-    if (!openwebuiUrl || !apiKey) {
-      return res.status(400).json({
-        error: 'Missing required parameters',
-        message: 'Please provide Open WebUI credentials via query parameters: ?url=YOUR_OPENWEBUI_URL&key=YOUR_API_KEY',
-        example: '/mcp?url=https://your-openwebui.com&key=your-api-key',
-      });
-    }
-    
-    const credentialsKey = `${openwebuiUrl}:${apiKey.substring(0, 8)}`;
-    
-    let mcpServer = mcpServers.get(credentialsKey);
-    if (!mcpServer) {
-      mcpServer = createMcpServer(openwebuiUrl, apiKey);
-      mcpServers.set(credentialsKey, mcpServer);
-    }
-    
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
-    
-    res.on('close', () => {
-      transport.close();
-    });
-    
-    await mcpServer.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error('MCP request error:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Internal server error', details: String(error) });
-    }
-  }
+// .well-known routes for MCP discovery
+app.all(/^\/\.well-known\/oauth-protected-resource(?:\/.*)?$/, handleNoOAuthMetadata);
+app.all(/^\/\.well-known\/oauth-authorization-server(?:\/.*)?$/, handleNoOAuthMetadata);
+app.get('/.well-known/mcp/server-card.json', (req: Request, res: Response) => {
+  trackRequest(req, '/.well-known/mcp/server-card.json');
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.json(getServerCard());
 });
+
+// MCP endpoint — key-service path-based auth: /mcp/usr_XXXXXXXX
+app.all('/mcp/:apiKey', async (req: Request, res: Response) => {
+  trackRequest(req, '/mcp');
+
+  if (!isKeyServiceEnabled()) {
+    sendJsonRpcError(res, 503, 'Key service not configured. Set KEY_SERVICE_URL and KEY_SERVICE_TOKEN.');
+    return;
+  }
+
+  const result = await resolveKeyCredentials(req.params.apiKey);
+  if (!result.ok) {
+    const statusMap = { invalid_key: 403, service_unavailable: 503, malformed_response: 502 } as const;
+    res.status(statusMap[result.reason]).json({
+      jsonrpc: '2.0',
+      error: {
+        code: -32600,
+        message: result.reason === 'invalid_key'
+          ? 'Invalid, expired, or revoked API key.'
+          : result.reason === 'service_unavailable'
+            ? 'Key service temporarily unavailable. Please try again later.'
+            : 'Key service returned incomplete credentials.',
+      },
+      id: null,
+    });
+    return;
+  }
+
+  await handleMcpRequest(req, res, result.credentials);
+});
+
+// MCP endpoint — key-service query-param auth: /mcp?api_key=usr_XXXXXXXX
+app.all('/mcp', async (req: Request, res: Response) => {
+  trackRequest(req, '/mcp');
+
+  // Detect and reject removed legacy auth pattern
+  if (req.query.url || req.query.key) {
+    sendJsonRpcError(
+      res,
+      400,
+      'Direct ?url=&key= authentication has been removed. This server now requires a usr_XXX API key from the MCP Key Service.',
+      {
+        error: 'auth_removed',
+        usage: {
+          path: withPublicBasePath('/mcp/usr_XXXXXXXX'),
+          query: withPublicBasePath('/mcp?api_key=usr_XXXXXXXX'),
+          register: 'Get your API key at the MCP Key Service portal.',
+        },
+      }
+    );
+    return;
+  }
+
+  if (!isKeyServiceEnabled()) {
+    sendJsonRpcError(res, 503, 'Key service not configured. Set KEY_SERVICE_URL and KEY_SERVICE_TOKEN.');
+    return;
+  }
+
+  const apiKey = (req.query.api_key as string) || (req.headers['x-api-key'] as string) || '';
+  if (!apiKey) {
+    sendJsonRpcError(
+      res,
+      403,
+      'Missing usr_XXX API key.',
+      {
+        error: 'missing_api_key',
+        usage: {
+          path: withPublicBasePath('/mcp/usr_XXXXXXXX'),
+          query: withPublicBasePath('/mcp?api_key=usr_XXXXXXXX'),
+          header: 'X-API-Key: usr_XXXXXXXX',
+        },
+      }
+    );
+    return;
+  }
+
+  const result = await resolveKeyCredentials(apiKey);
+  if (!result.ok) {
+    const statusMap = { invalid_key: 403, service_unavailable: 503, malformed_response: 502 } as const;
+    res.status(statusMap[result.reason]).json({
+      jsonrpc: '2.0',
+      error: {
+        code: -32600,
+        message: result.reason === 'invalid_key'
+          ? 'Invalid, expired, or revoked API key.'
+          : result.reason === 'service_unavailable'
+            ? 'Key service temporarily unavailable. Please try again later.'
+            : 'Key service returned incomplete credentials.',
+      },
+      id: null,
+    });
+    return;
+  }
+
+  await handleMcpRequest(req, res, result.credentials);
+});
+
+// MCP diagnostics endpoint (env-gated, no auth)
+if (ENABLE_MCP_DIAGNOSTICS) {
+  app.all('/mcp-debug/open', async (req: Request, res: Response) => {
+    trackRequest(req, '/mcp-debug/open');
+    await handleServerRequest(req, res, createDiagnosticMcpServer());
+  });
+}
 
 // Graceful shutdown
 async function gracefulShutdown(signal: string) {
@@ -1075,9 +1437,15 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 // Start server
 app.listen(PORT, HOST, () => {
   console.log(`\n🚀 Open WebUI MCP Server running on http://${HOST}:${PORT}`);
-  console.log(`   Health: http://${HOST}:${PORT}/health`);
-  console.log(`   MCP:    http://${HOST}:${PORT}/mcp`);
-  console.log(`   Analytics: http://${HOST}:${PORT}/analytics`);
-  console.log(`   Dashboard: http://${HOST}:${PORT}/analytics/dashboard`);
+  console.log(`   Health:     ${withPublicBasePath('/health')}`);
+  console.log(`   Public base path: ${PUBLIC_BASE_PATH || '/'}`);
+  console.log(`   MCP:        ${withPublicBasePath('/mcp/usr_XXXXXXXX')}`);
+  console.log(`   ServerCard: ${withPublicBasePath('/.well-known/mcp/server-card.json')}`);
+  console.log(`   Analytics:  ${withPublicBasePath('/analytics')}`);
+  console.log(`   Dashboard:  ${withPublicBasePath('/analytics/dashboard')}`);
+  console.log(`   Analytics auth: ${MCP_API_KEY ? 'X-API-Key required' : 'disabled (set MCP_API_KEY)'}`);
+  if (ENABLE_MCP_DIAGNOSTICS) {
+    console.log(`   Diagnostics: ${withPublicBasePath('/mcp-debug/open')}`);
+  }
   console.log(`\n📊 Analytics will be saved to: ${ANALYTICS_FILE}`);
 });

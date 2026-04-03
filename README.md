@@ -79,7 +79,7 @@ I maintain several MCP servers (Malaysia Open Data, LTA DataMall, Ghost CMS, Mal
 
 ### 3. **Multi-Tenant Support**
 
-The original uses environment variables for authentication. I needed URL-based credentials so multiple users can connect to the same server with their own Open WebUI instances — no server restart required.
+The original uses environment variables for authentication. This server uses the MCP Key Service for centralized credential management — users register their Open WebUI credentials once and receive a `usr_` API key for secure access.
 
 ### 4. **Streamable HTTP Transport**
 
@@ -100,7 +100,7 @@ Modern MCP clients (Claude Desktop, Cursor, Windsurf) work best with Streamable 
 | **Transport** | stdio / HTTP | Streamable HTTP only |
 | **Installation** | `pip install` / `uvx` | Docker container |
 | **Hosting** | Local machine | Self-hosted VPS |
-| **Authentication** | Environment variables | URL query parameters |
+| **Authentication** | Environment variables | MCP Key Service (`usr_` keys) |
 | **Multi-Tenant** | ❌ Single instance | ✅ Multiple users/instances |
 | **Deployment** | Manual | Auto via GitHub Actions |
 | **Analytics** | None | Firebase + visual dashboard |
@@ -119,9 +119,11 @@ src/openwebui_mcp/
 **New TypeScript Structure:**
 ```
 src/
-├── http-server.ts       # Express + MCP SDK server
-├── openwebui-client.ts  # Open WebUI API client
-└── firebase-analytics.ts # Analytics module
+├── http-server.ts        # Express + MCP SDK server
+├── openwebui-client.ts   # Open WebUI API client
+├── firebase-analytics.ts # Analytics module
+└── utils/
+    └── key-service.ts    # MCP Key Service integration
 ```
 
 ### Why TypeScript Instead of Python?
@@ -136,20 +138,40 @@ src/
 ## ✨ Features
 
 - **🌐 Remote Access** — Connect from any MCP client via HTTPS (not just local)
-- **🔐 Multi-Tenant** — Each user provides their own Open WebUI credentials via URL
+- **🔐 Key Service Auth** — Secure credential management via MCP Key Service (`usr_` API keys)
 - **📊 60+ Tools** — Full management of users, groups, models, knowledge bases, chats, prompts, memories, tools, functions, and more
 - **🔄 Auto-Deployment** — Push to GitHub, automatically deploys to VPS via GitHub Actions
 - **📈 Analytics Dashboard** — Built-in usage tracking with Firebase integration
 - **🐳 Docker Ready** — Production-ready Dockerfile with health checks
-- **🔒 Secure** — Credentials passed per-request, never stored on server
+- **🔒 Secure** — Credentials encrypted at rest via Key Service, resolved per-request, never stored on MCP server
 
 ---
 
 ## 🚀 Quick Start
 
-### Add to Your MCP Client
+### Step 1: Get Your API Key
 
-Copy this configuration to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
+This server uses the **MCP Key Service** for authentication. You'll need a `usr_` API key:
+
+1. Visit the [MCP Key Service portal](https://mcpkeys.techmavie.digital)
+2. Register and select the **Open WebUI** connector
+3. Enter your Open WebUI instance URL and API key (found in Open WebUI → Settings → Account → API Keys)
+4. Save the generated `usr_XXXXXXXX` key — it cannot be retrieved later
+
+### Step 2: Add to Your MCP Client
+
+Use either URL format:
+The examples below assume `PUBLIC_BASE_PATH=/openwebui`.
+
+**Path-based** (recommended):
+```
+https://mcp.techmavie.digital/openwebui/mcp/usr_YOUR_KEY_HERE
+```
+
+**Query-param**:
+```
+https://mcp.techmavie.digital/openwebui/mcp?api_key=usr_YOUR_KEY_HERE
+```
 
 **Claude Desktop** (`claude_desktop_config.json`):
 ```json
@@ -157,7 +179,7 @@ Copy this configuration to your MCP client (Claude Desktop, Cursor, Windsurf, et
   "mcpServers": {
     "openwebui": {
       "transport": "streamable-http",
-      "url": "https://mcp.techmavie.digital/openwebui/mcp?url=YOUR_OPENWEBUI_URL&key=YOUR_API_KEY"
+      "url": "https://mcp.techmavie.digital/openwebui/mcp/usr_YOUR_KEY_HERE"
     }
   }
 }
@@ -168,23 +190,10 @@ Copy this configuration to your MCP client (Claude Desktop, Cursor, Windsurf, et
 {
   "openwebui": {
     "transport": "streamable-http",
-    "url": "https://mcp.techmavie.digital/openwebui/mcp?url=YOUR_OPENWEBUI_URL&key=YOUR_API_KEY"
+    "url": "https://mcp.techmavie.digital/openwebui/mcp/usr_YOUR_KEY_HERE"
   }
 }
 ```
-
-### URL Parameters
-
-| Parameter | Required | Description | Example |
-|-----------|----------|-------------|---------|
-| `url` | Yes | Your Open WebUI instance URL | `https://ai.example.com` |
-| `key` | Yes | Your Open WebUI API key | `sk-abc123...` |
-
-### Get Your API Key
-
-1. Log in to your Open WebUI instance
-2. Go to **Settings → Account**
-3. Copy your API key
 
 ---
 
@@ -299,11 +308,16 @@ Copy this configuration to your MCP client (Claude Desktop, Cursor, Windsurf, et
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Server information |
-| `/health` | GET | Health check |
-| `/mcp` | POST | MCP protocol endpoint |
-| `/analytics` | GET | Analytics JSON data |
-| `/analytics/dashboard` | GET | Visual analytics dashboard |
+| `/openwebui/` | GET | Server information |
+| `/openwebui/health` | GET | Health check |
+| `/openwebui/mcp/usr_XXX` | POST | MCP endpoint (path-based key) |
+| `/openwebui/mcp?api_key=usr_XXX` | POST | MCP endpoint (query-param key) |
+| `/openwebui/.well-known/mcp/server-card.json` | GET | MCP server discovery card |
+| `/openwebui/mcp-debug/open` | POST | Diagnostics (env-gated) |
+| `/openwebui/analytics` | GET | Analytics JSON data (`X-API-Key` required) |
+| `/openwebui/analytics/dashboard` | GET | Visual analytics dashboard |
+
+When running the app at the domain root instead of `/openwebui`, drop that prefix and set `PUBLIC_BASE_PATH=/`.
 
 ---
 
@@ -332,12 +346,24 @@ mkdir -p /opt/mcp-servers/mcp-openwebui
 cd /opt/mcp-servers/mcp-openwebui
 git clone https://github.com/hithereiamaliff/mcp-openwebui.git .
 
+# Create .env with key-service credentials
+cat > .env << 'EOF'
+MCP_API_KEY=your-analytics-api-key
+PUBLIC_BASE_PATH=/openwebui
+KEY_SERVICE_URL=http://mcp-key-service:8090/internal/resolve
+KEY_SERVICE_TOKEN=your-internal-server-token
+ENABLE_MCP_DIAGNOSTICS=false
+EOF
+
 # Build and start
 docker compose up -d --build
 
 # Check logs
 docker compose logs -f
 ```
+
+> **Note:** `KEY_SERVICE_URL` should use `http://mcp-key-service:8090/internal/resolve` when both containers are on the same Docker network, or `https://mcpkeys.techmavie.digital/internal/resolve` for external access.
+> Set `PUBLIC_BASE_PATH` to the public subpath your reverse proxy exposes, and set `MCP_API_KEY` if you want `/analytics` protected.
 
 ### Configure Nginx
 
@@ -347,6 +373,8 @@ sudo nano /etc/nginx/sites-available/mcp.techmavie.digital
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+The provided nginx snippet keeps MCP discovery under `/openwebui/.well-known/...` so it can coexist with sibling MCP servers on the same domain without duplicate `location = /.well-known/...` conflicts.
 
 ### GitHub Secrets (for auto-deployment)
 
@@ -361,24 +389,41 @@ Set these in your repository settings:
 
 ## 🔧 Troubleshooting
 
-### "Missing url or key parameter"
+### "auth_removed" or "Direct ?url=&key= authentication has been removed"
 
-**Problem:** You're getting an error about missing credentials.
+**Problem:** You're using the old authentication format.
 
-**Solution:** Make sure your URL includes both `url` and `key` parameters:
+**Solution:** This server now requires a `usr_` API key from the MCP Key Service. Update your URL to:
 ```
-https://mcp.techmavie.digital/openwebui/mcp?url=YOUR_OPENWEBUI_URL&key=YOUR_API_KEY
+https://mcp.techmavie.digital/openwebui/mcp/usr_YOUR_KEY_HERE
 ```
 
-### "Invalid API key" or "Unauthorized"
+### "Invalid, expired, or revoked API key" (403)
 
-**Problem:** Your Open WebUI API key is incorrect or expired.
+**Problem:** Your `usr_` API key is invalid, expired, or has been revoked.
 
 **Solution:**
-1. Log in to your Open WebUI instance
-2. Go to **Settings → Account**
-3. Generate a new API key
-4. Update your MCP client configuration
+1. Visit the [MCP Key Service portal](https://mcpkeys.techmavie.digital) to check your key status
+2. If needed, rotate your key to generate a new one
+3. Update your MCP client configuration with the new key
+
+### "Key service temporarily unavailable" (503)
+
+**Problem:** The key service is unreachable or not configured.
+
+**Solution (for self-hosters):**
+1. Ensure `KEY_SERVICE_URL` and `KEY_SERVICE_TOKEN` are set in your `.env`
+2. Check that the key-service container is running: `docker ps | grep mcp-key-service`
+3. Verify network connectivity between containers
+
+### "Valid X-API-Key header required" (401)
+
+**Problem:** You're opening the analytics JSON endpoint without the analytics API key.
+
+**Solution:**
+1. Set `MCP_API_KEY` in your deployment `.env`
+2. Open `https://mcp.techmavie.digital/openwebui/analytics/dashboard`
+3. Enter that same key in the dashboard prompt so requests are sent with `X-API-Key`
 
 ### "Connection refused" or "502 Bad Gateway"
 
@@ -421,7 +466,7 @@ docker compose down && docker compose up -d --build
 This MCP includes a built-in analytics dashboard to track usage:
 
 - **View Dashboard:** `https://mcp.techmavie.digital/openwebui/analytics/dashboard`
-- **Raw JSON Data:** `https://mcp.techmavie.digital/openwebui/analytics`
+- **Raw JSON Data:** `https://mcp.techmavie.digital/openwebui/analytics` with `X-API-Key: YOUR_MCP_API_KEY`
 
 The dashboard shows:
 - Total requests and tool calls
@@ -429,7 +474,7 @@ The dashboard shows:
 - Requests by hour
 - Client information
 
-Analytics are stored in Firebase Realtime Database with local file backup.
+Analytics are stored in Firebase Realtime Database with local file backup. Client IPs are hashed before storage, and the dashboard stores `MCP_API_KEY` only in browser session storage for the current tab.
 
 ---
 

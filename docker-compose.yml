@@ -13,6 +13,11 @@ services:
       - HOST=0.0.0.0
       - ANALYTICS_DIR=/app/data
       - NODE_ENV=production
+      - MCP_API_KEY=${MCP_API_KEY:-}
+      - PUBLIC_BASE_PATH=${PUBLIC_BASE_PATH:-/openwebui}
+      - KEY_SERVICE_URL=${KEY_SERVICE_URL:-}
+      - KEY_SERVICE_TOKEN=${KEY_SERVICE_TOKEN:-}
+      - ENABLE_MCP_DIAGNOSTICS=${ENABLE_MCP_DIAGNOSTICS:-false}
       - FIREBASE_DATABASE_URL=${FIREBASE_DATABASE_URL:-https://mcp-analytics-49b45-default-rtdb.asia-southeast1.firebasedatabase.app}
       - FIREBASE_CREDENTIALS_PATH=/app/.credentials/firebase-service-account.json
     volumes:
