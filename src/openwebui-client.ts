@@ -4,6 +4,7 @@
  */
 
 import axios, { AxiosInstance, AxiosError } from 'axios';
+import { randomUUID } from 'crypto';
 
 export interface OpenWebUIConfig {
   url: string;
@@ -229,6 +230,69 @@ export class OpenWebUIClient {
 
   async cloneChat(chatId: string): Promise<unknown> {
     return this.request('GET', `/api/v1/chats/${chatId}/clone`);
+  }
+
+  // Create a new chat from a full Open WebUI chat object blob.
+  // NOTE: this stores content only — it does NOT run the model / generate a reply.
+  async createChat(chat: Record<string, unknown>): Promise<unknown> {
+    return this.request('POST', '/api/v1/chats/new', { chat });
+  }
+
+  // Overwrite a chat with a full chat object blob. Open WebUI reconciles the
+  // entire message tree from what you send, so callers must pass a COMPLETE
+  // chat object (read via getChat first, mutate, then send). Stores content
+  // only — does NOT run the model.
+  async updateChat(chatId: string, chat: Record<string, unknown>): Promise<unknown> {
+    return this.request('POST', `/api/v1/chats/${chatId}`, { chat });
+  }
+
+  // Safely append ONE message to an existing chat thread without clobbering it:
+  // read the current chat, thread the new node onto history.currentId (the
+  // current leaf), then write the full blob back. Stores content only — does
+  // NOT generate an assistant reply (use /api/chat/completions for that).
+  async appendChatMessage(
+    chatId: string,
+    role: string,
+    content: string,
+    model?: string
+  ): Promise<unknown> {
+    const existing = (await this.getChat(chatId)) as any;
+    // getChat returns the chat record; the editable blob lives under `.chat`.
+    const chat = (existing && typeof existing === 'object' && existing.chat)
+      ? existing.chat
+      : existing;
+    if (!chat || typeof chat !== 'object') {
+      throw new Error('Unexpected chat shape from Open WebUI; cannot append message.');
+    }
+
+    chat.history = chat.history || { messages: {}, currentId: null };
+    chat.history.messages = chat.history.messages || {};
+    chat.messages = Array.isArray(chat.messages) ? chat.messages : [];
+
+    const id = randomUUID();
+    const parentId = chat.history.currentId ?? null;
+    const timestamp = Math.floor(Date.now() / 1000);
+
+    const node: Record<string, unknown> = {
+      id,
+      parentId,
+      childrenIds: [],
+      role,
+      content,
+      timestamp,
+    };
+    if (model) node.model = model;
+
+    chat.history.messages[id] = node;
+    if (parentId && chat.history.messages[parentId]) {
+      const parent = chat.history.messages[parentId];
+      parent.childrenIds = Array.isArray(parent.childrenIds) ? parent.childrenIds : [];
+      parent.childrenIds.push(id);
+    }
+    chat.history.currentId = id;
+    chat.messages.push(node);
+
+    return this.updateChat(chatId, chat as Record<string, unknown>);
   }
 
   // ==========================================================================

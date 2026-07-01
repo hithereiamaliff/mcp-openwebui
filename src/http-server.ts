@@ -510,6 +510,31 @@ function createMcpServer(openwebuiUrl: string, apiKey: string) {
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   });
 
+  server.tool('create_chat', 'Create a new chat from a full Open WebUI chat object blob (title, models, messages, history with messages map + currentId). Stores content only — does NOT run the model. Use /api/chat/completions to make the agent actually respond.', {
+    chat: z.record(z.any()).describe('Full Open WebUI chat object blob'),
+  }, async (args) => {
+    const result = await client.createChat(args.chat);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  });
+
+  server.tool('update_chat', 'Overwrite a chat with a full chat object blob. WARNING: Open WebUI reconciles the ENTIRE message tree — read the chat first with get_chat, modify, then send the complete object, or existing messages are clobbered. For adding one message, prefer append_chat_message. Stores content only — does NOT run the model.', {
+    chat_id: z.string().describe('Chat ID'),
+    chat: z.record(z.any()).describe('Full Open WebUI chat object blob'),
+  }, async (args) => {
+    const result = await client.updateChat(args.chat_id, args.chat);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  });
+
+  server.tool('append_chat_message', 'Safely append a single message to an existing chat thread. Reads the current leaf, threads the new message onto it, writes back — does NOT clobber existing messages. Stores content only — does NOT generate an assistant reply.', {
+    chat_id: z.string().describe('Chat ID'),
+    role: z.string().describe("Message role: 'user' or 'assistant'"),
+    content: z.string().describe('Message text content'),
+    model: z.string().optional().describe('Model id to attribute an assistant message to (optional)'),
+  }, async (args) => {
+    const result = await client.appendChatMessage(args.chat_id, args.role, args.content, args.model);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  });
+
   // ==========================================================================
   // Prompt Management Tools
   // ==========================================================================
